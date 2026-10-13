@@ -31,7 +31,7 @@ os.getcwd()
 ```{python}
 import pandas as pd
 df = pd.read_excel(
-    "/Users/wangenyou/Desktop/LA Final B/CLEAR and RACE Datasets/CLEAR0130.xlsx"
+    "/Users/wangenyou/Desktop/LA Final B/CLEAR and RACE Datasets/CLEAR_Dataset_Cleaned_1620.xlsx"
 )
 ```
 
@@ -120,9 +120,20 @@ kmeans = KMeans(
     n_init=20
 )
 
-df_emb["kmeans_cluster"] = kmeans.fit_predict(X_vocab_scaled) + 1
-```
+# Always build the word-level matrix from df_emb in this chunk.
+# This prevents a stale document-level (1620-row) variable from being used.
+embedding_cols = [c for c in df_emb.columns if c.startswith("emb_")]
+assert embedding_cols, "No FastText embedding columns found in df_emb"
+X_vocab_for_kmeans = df_emb[embedding_cols].to_numpy(dtype=float)
+assert len(X_vocab_for_kmeans) == len(df_emb), "Word-level row count mismatch"
+X_vocab_scaled = StandardScaler().fit_transform(X_vocab_for_kmeans)
+assert X_vocab_scaled.shape[0] == len(df_emb), "K-Means input must match vocabulary rows"
 
+print("K-Means vocabulary rows:", len(df_emb))
+print("K-Means input shape:", X_vocab_scaled.shape)
+df_emb["kmeans_cluster"] = kmeans.fit_predict(X_vocab_scaled) + 1
+assert df_emb["kmeans_cluster"].between(1, K).all(), "Invalid cluster labels"
+```
 ```{python}
 df_emb.to_excel("fasttext_vocab_with_kmeans.xlsx", index=False)
 ```
@@ -166,8 +177,9 @@ word2cluster = dict(
 
 # 3️⃣ cluster 數
 K = df_kmeans["kmeans_cluster"].nunique()
+assert K == 20 and set(df_kmeans["kmeans_cluster"].dropna().astype(int)) == set(range(1, 21)), "Expected Cluster labels 1–20"
 
-# 4️⃣ tokenize 文
+# 4️⃣ tokenize 文件（一定要先有 df）
 nltk.download("punkt")
 
 doc_tokens = [
@@ -197,6 +209,7 @@ for tokens in doc_tokens:
     X_doc.append(vec)
 
 X_doc = np.array(X_doc)
+assert X_doc.shape == (len(df), K), "Document feature rows must match source documents"
 ```
 
 ```{python}
@@ -227,6 +240,7 @@ reading_cols = [
 X_cluster = X_doc
 X_reading = df[reading_cols].values
 X_both = np.hstack([X_cluster, X_reading])
+assert X_both.shape == (len(df), 22), "Expected 20 cluster + 2 readability features per document"
 
 y = df["BT Easiness"].values
 
@@ -287,11 +301,12 @@ import shap
 import numpy as np
 import matplotlib.pyplot as plt
 
+from pathlib import Path
 from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler
 
 # -----------------------------
-# Feature names: 20 clusters + 2 readability indices
+# 1. Feature names
 # -----------------------------
 
 cluster_names = [f"Cluster {i+1}" for i in range(20)]
@@ -303,59 +318,111 @@ reading_names = [
 
 feature_names = cluster_names + reading_names
 
-# Check that we really have 22 features
 print("Number of features:", len(feature_names))
 print("Shape of X_both:", X_both.shape)
 
+assert X_both.shape[1] == 22
+
 # -----------------------------
-# Standardize features
+# 2. Standardize features
 # -----------------------------
 
 scaler = StandardScaler()
 X_svr_scaled = scaler.fit_transform(X_both)
 
 # -----------------------------
-# Train final linear SVR
+# 3. Train final Linear SVR
 # -----------------------------
 
 model = SVR(kernel="linear", C=1)
-model.fit(X_svr_scaled, y)
+model.fit(X_svr_scaled, np.asarray(y).ravel())
 
 # -----------------------------
-# Calculate SHAP values
+# 4. Calculate SHAP values
+#    Use LinearExplainer instead
+#    of PermutationExplainer
 # -----------------------------
 
-explainer = shap.Explainer(model.predict, X_svr_scaled)
-shap_values = explainer(X_svr_scaled)
+# Linear SVR prediction:
+# f(x) = coef_ @ x + intercept_
+
+coefficients = model.coef_.ravel()
+intercept = float(model.intercept_[0])
+
+background_mean = X_svr_scaled.mean(axis=0)
+
+# SHAP values for a linear model
+# with an independent-feature masker
+shap_array = (
+    X_svr_scaled - background_mean
+) * coefficients
+
+base_value = (
+    intercept
+    + np.dot(background_mean, coefficients)
+)
+
+shap_values = shap.Explanation(
+    values=shap_array,
+    base_values=np.full(
+        X_svr_scaled.shape[0],
+        base_value
+    ),
+    data=X_svr_scaled,
+    feature_names=feature_names
+)
+
+# Verify SHAP values reproduce predictions
+reconstructed = (
+    shap_array.sum(axis=1) + base_value
+)
+
+np.testing.assert_allclose(
+    reconstructed,
+    model.predict(X_svr_scaled),
+    rtol=1e-5,
+    atol=1e-5
+)
+
+print("SHAP values calculated successfully!")
+
 
 # -----------------------------
-# Plot all 22 features
+# 5. Horizontal SHAP summary plot
 # -----------------------------
 
-plt.figure(figsize=(9, 10))
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+# Wider landscape layout
+plt.close("all")
 
 shap.summary_plot(
-    shap_values,
+    shap_values.values,
     X_svr_scaled,
     feature_names=feature_names,
     max_display=22,
+    plot_size=(12, 8),
     show=False
 )
 
-plt.xlabel(
+fig = plt.gcf()
+ax = fig.axes[0]
+
+ax.set_xlabel(
     "SHAP value (impact on predicted BT Easiness)",
-    fontsize=11
+    fontsize=12
 )
 
-plt.xticks(fontsize=9)
-plt.yticks(fontsize=9)
+ax.tick_params(axis="x", labelsize=10)
+ax.tick_params(axis="y", labelsize=10)
 
-plt.tight_layout()
-
-plt.savefig(
-    "SHAP_summary_22_features.png",
-    dpi=300,
-    bbox_inches="tight"
+# Leave room for labels and colorbar
+fig.subplots_adjust(
+    left=0.30,
+    right=0.91,
+    bottom=0.14,
+    top=0.96
 )
 
 plt.show()
@@ -427,9 +494,9 @@ ax.set_xlim(x_low, x_high)
 ax.set_ylim(y_low, y_high)
 ax.set_zlim(z_low, z_high)
 
-ax.set_xlabel("PC1")
-ax.set_ylabel("PC2")
-ax.set_zlabel("PC3")
+ax.set_xlabel("PC1", labelpad=7)
+ax.set_ylabel("PC2", labelpad=7)
+ax.set_zlabel("PC3", labelpad=7)
 
 ax.set_title(
     "PCA Visualization of FastText Embeddings and K-means Clusters",
